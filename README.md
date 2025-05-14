@@ -28,7 +28,8 @@ The CloudFormation template is written in YAML for clarity and ease of maintenan
 - **LatestAmiId:** Dynamically fetches the latest Amazon Linux 2 AMI ID using AWS Systems Manager Parameter Store.
 
 ---
-
+Read the full guide on my website: [Serverless-Ready WordPress on AWS via CloudFormation](https://homelab.sanjuprojects.uk/serverless%E2%80%91ready-wordpress-on-aws-via-cloudformation/)
+---
 ## 🛠 Deployment Instructions
 
 1. **Clone the Repository:**
