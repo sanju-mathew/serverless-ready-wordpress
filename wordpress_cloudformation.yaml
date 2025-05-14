@@ -1,0 +1,393 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "CloudFormation template to deploy WordPress on t2.micro with RDS, EFS, ALB and Launch Template in eu-west-2"
+
+Parameters:
+  # SSH key for EC2 instances this key can be created in the EC2 section of the AWS console under network and security (Key Pairs)
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+
+  # Database admin credentials
+  DBUsername:
+    Description: The database admin account username
+    Type: String
+    MinLength: 1
+    MaxLength: 16
+    Default: wordpress
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBPassword:
+    Description: The database admin account password
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+  # EC2 instance type (t2.micro fixed) because i wanted to be within the free tier
+  # Allowed values are t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+
+  # Latest Amazon Linux 2 AMI via SSM Parameter
+  # This is the latest Amazon Linux 2 AMI ID for eu-west-2 (London) region
+  # The AMI ID is retrieved from the SSM Parameter Store using the AWS::SSM::Parameter::Value type
+  # The AMI ID is automatically updated when a new version is released
+  # The AMI ID is used in the Launch Template for the EC2 instances
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID for eu-west-2
+
+Resources:
+  # 1. Networking components for the VPC, subnets, route tables, and internet gateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: wordpress-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: wordpress-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  # Public subnets in two AZs for high availability I have chosen to use two public subnets in different availability zones (AZs) for high availability
+  # The subnets are created in the same VPC as the ALB and EC2 instances
+  # The subnets are configured to automatically assign public IP addresses to instances launched in them
+  # The subnets are tagged with a name for easy identification
+  # The subnets are associated with a route table that has a route to the internet via the internet gateway
+  # The route table is associated with the subnets to enable internet access
+  # The subnets are used for the EC2 instances and the ALB
+  # The subnets are also used for the EFS mount targets
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: wordpress-subnet-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: wordpress-subnet-b
+
+  # Public route table and default route to the internet gateway
+  # The public route table is created in the same VPC as the subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: wordpress-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # 2. Security groups for ALB, EC2 instances, RDS, and EFS
+  # The security groups are created in the same VPC as the subnets
+  # The security groups are configured to allow traffic between the ALB, EC2 instances, RDS, and EFS
+  # The security groups are tagged with a name for easy identification
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from anywhere
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  # 3. EFS for persistent storage for my wp-content directory
+  # The EFS file system is created in the same VPC as the subnets
+  # The EFS file system is configured to use the general purpose performance mode
+  # The EFS file system is encrypted at rest
+  # The EFS file system is tagged with a name for easy identification
+  # The EFS mount targets are created in the same subnets as the EC2 instances
+  # The EFS mount targets are configured to use the same security group as the EC2 instances
+  # The EFS mount targets are used to mount the EFS file system on the EC2 instances
+  WordPressEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: wordpress-efs
+
+  EFSSubnetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSSubnetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # 4. RDS MySQL database instance for WordPress
+  # The RDS instance is created in the same VPC as the subnets
+  # The RDS instance is configured to use the MySQL engine
+  # The RDS instance is configured to use the db.t3.micro instance type (there is no option for t2.micro)
+  # The RDS instance is configured to use the latest MySQL version
+  # The RDS instance is configured to use the same security group as the EC2 instances
+  # The RDS instance is configured to use the same subnet group as the EC2 instances
+  # The RDS instance is configured to use the same VPC as the EC2 instances
+  # The RDS instance is configured to use the same database name as the WordPress installation
+  # The RDS instance is configured to use the same database username and password as the WordPress installation
+  # The RDS instance is configured to use the same database engine version as the WordPress installation
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      DBSubnetGroupName: wordpress-db-subnet-group
+
+  WordPressDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      EngineVersion: 8.0
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: wordpress
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+
+  # 5. ALB and listener for routing traffic to the EC2 instances
+  # The ALB is created in the same VPC as the subnets
+  # The ALB is configured to use the HTTP protocol
+  # The ALB is configured to use the same security group as the EC2 instances
+  # The ALB is configured to use the same target group as the EC2 instances
+  # The ALB is configured to use the same listener as the EC2 instances
+  WordPressALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # 6. IAM role & instance profile for EC2 instances
+  # The IAM role is created in the same VPC as the subnets
+  # The IAM role is configured to allow EC2 instances to assume the role                            
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+
+  # 7. Launch Template for EC2/UserData to install WordPress and configure Apache
+  # The Launch Template is created in the same VPC as the subnets
+  # The Launch Template is configured to use the latest Amazon Linux 2 AMI
+  # The Launch Template is configured to use the same instance type as the EC2 instances
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: wordpress-lt
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        ImageId: !Ref LatestAmiId
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # ? Enable & install PHP?8.0 via Amazon Linux Extras
+            amazon-linux-extras enable php8.0
+            yum clean metadata
+            yum install -y httpd php php-mysqlnd amazon-efs-utils
+
+            # ? Start Apache
+            systemctl enable httpd
+            systemctl start httpd
+
+            # ? Mount EFS for wp?content
+            mkdir -p /var/www/html/wp-content
+            mount -t efs -o tls ${WordPressEFS}:/ /var/www/html/wp-content
+            echo "${WordPressEFS}:/ /var/www/html/wp-content efs defaults,_netdev 0 0" >> /etc/fstab
+
+            # ? Download and unpack WordPress
+            cd /var/www/html
+            curl -O https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz --strip-components=1
+            chown -R apache:apache /var/www/html
+
+            # ? Configure wp?config.php
+            cp wp-config-sample.php wp-config.php
+            sed -i "s/database_name_here/wordpress/" wp-config.php
+            sed -i "s/username_here/${DBUsername}/" wp-config.php
+            sed -i "s/password_here/${DBPassword}/" wp-config.php
+            sed -i "s|define( 'DB_HOST', '.*' );|define( 'DB_HOST', '${WordPressDB.Endpoint.Address}:3306' );|" wp-config.php
+            # ? Final restart
+            systemctl restart httpd
+
+  # 8. Auto Scaling Group referencing the Launch Template 
+  AutoScalingGroup:
+   Type: AWS::AutoScaling::AutoScalingGroup
+   Properties:
+    VPCZoneIdentifier:
+      - !Ref PublicSubnetA
+      - !Ref PublicSubnetB
+
+    LaunchTemplate:
+      LaunchTemplateId: !Ref WordPressLaunchTemplate
+      Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+
+    MinSize: '1'
+    MaxSize: '2'
+    DesiredCapacity: '1'
+    TargetGroupARNs:
+      - !Ref WordPressTargetGroup
+
+    Tags:
+      - Key: Name
+        Value: wordpress-instance
+        PropagateAtLaunch: true
+
+# URL to access the WordPress site this is the link to my wordpress site when the stack is created
+# The URL is constructed using the DNS name of the ALB
+# The URL is outputted as a CloudFormation stack output
+# The URL can be accessed in the AWS console under CloudFormation > Stacks > Outputs
+Outputs:
+  WebsiteURL:
+    Value: !Sub "http://${WordPressALB.DNSName}/"
